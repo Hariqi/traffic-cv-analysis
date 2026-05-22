@@ -265,6 +265,9 @@ class PedestrianAnalyzer:
                 self.veh_last_m_band_crossed[vid] = front_m_band
                 self.veh_segment_cross_time[(vid, front_m_band)] = timestamp
 
+    # ---------------------------------------------------------
+    # FIXED DIRECTIONAL WALKING SPEED ENGINE
+    # ---------------------------------------------------------
     def _calculate_full_ped_metrics(self, pid):
         df = pd.DataFrame(self.ped_history.get(pid, []), columns=["t", "cx", "cy", "zone"])
         if df.empty or not df[df.zone.isin(["L", "M", "R"])].shape[0] >= 1: return None
@@ -273,14 +276,13 @@ class PedestrianAnalyzer:
         if len(past_lanes) < 2: return None
 
         waiting = self.ped_frozen_waiting_time.get(pid, 0.0)
-        lane_entries = df.loc[df.zone.isin(["L", "M", "R"]), "t"]
-        cross_start = lane_entries.min()
-        cross_end = lane_entries.max()
-
+        
+        # Extract individual lane entries
         l_entry = df.loc[df.zone == "L", "t"].min()
         m_entry = df.loc[df.zone == "M", "t"].min()
         r_entry = df.loc[df.zone == "R", "t"].min()
 
+        # Determine true direction of movement
         direction = "Down"
         valid_entries = []
         if pd.notna(l_entry): valid_entries.append((l_entry, "L"))
@@ -293,8 +295,13 @@ class PedestrianAnalyzer:
             if (first in ["R", "M"]) and last == "L": direction = "Up"
             elif first == "R" and last == "M": direction = "Up"
 
+        # Setup exit and entry timelines based on direction
+        lane_entries = df.loc[df.zone.isin(["L", "M", "R"]), "t"]
+        cross_end = lane_entries.max()
+        
         t_exit_L, t_exit_M, t_exit_R = None, None, None
         timeline = []
+        
         if direction == "Down":
             t_exit_L = m_entry if pd.notna(m_entry) else (r_entry if pd.notna(r_entry) else cross_end)
             t_exit_M = r_entry if pd.notna(r_entry) else cross_end
@@ -302,6 +309,9 @@ class PedestrianAnalyzer:
             if pd.notna(l_entry): timeline.append(("L", l_entry, t_exit_L))
             if pd.notna(m_entry): timeline.append(("M", m_entry, t_exit_M))
             if pd.notna(r_entry): timeline.append(("R", r_entry, t_exit_R))
+            
+            # If moving Down, they start at L/M. Treat first clean lane transition as true movement.
+            cross_start = l_entry if pd.notna(l_entry) else m_entry
         else:
             t_exit_R = m_entry if pd.notna(m_entry) else (l_entry if pd.notna(l_entry) else cross_end)
             t_exit_M = l_entry if pd.notna(l_entry) else cross_end
@@ -309,22 +319,34 @@ class PedestrianAnalyzer:
             if pd.notna(r_entry): timeline.append(("R", r_entry, t_exit_R))
             if pd.notna(m_entry): timeline.append(("M", m_entry, t_exit_M))
             if pd.notna(l_entry): timeline.append(("L", l_entry, t_exit_L))
+            
+            # If moving Up (from bottom), they wait in R. True crossing movement begins when they hit Lane M!
+            cross_start = m_entry if pd.notna(m_entry) else r_entry
 
-        # UPGRADE JITTER PROTECTION: Prevents extremely high outlier split speeds near dividing lane borders
         def calc_speed(entry, exit_t):
             if pd.isna(entry) or pd.isna(exit_t): return None
             duration = exit_t - entry
             if duration <= 0.001: return None
             raw_speed = LANE_WIDTH / duration
-            return min(raw_speed, 4.5) if duration < 0.25 else raw_speed  # Filters out noise anomalies
+            return min(raw_speed, 4.5) if duration < 0.25 else raw_speed
 
-        # FIX: Swapped implicit evaluation lines for robust structural 'is not None' checking rules
+        # FIXED UNPACKING COMPREHENSION PASS
+        measured_lanes = len({
+            row_zone for t_val, _, _, row_zone in df.values 
+            if row_zone in ["L", "M", "R"] and (cross_start <= t_val <= cross_end)
+        })
+        active_distance = measured_lanes * LANE_WIDTH
+
         has_valid_timeline = (cross_start is not None) and (cross_end is not None)
-        overall_spd = (3 * LANE_WIDTH / (cross_end - cross_start)) if (has_valid_timeline and (cross_end - cross_start) > 0.001) else None
+        active_duration = cross_end - cross_start
+        
+        overall_spd = (active_distance / active_duration) if (has_valid_timeline and active_duration > 0.001) else 0.0
 
         return {
             "pid": pid, "direction": direction,
-            "T_start_crossing": cross_start, "frozen_wait_time": waiting, "cross_end": cross_end,
+            "T_start_crossing": lane_entries.min(), 
+            "frozen_wait_time": waiting + (cross_start - lane_entries.min() if direction == "Up" else 0), 
+            "cross_end": cross_end,
             "T_exit_L": t_exit_L, "T_exit_M": t_exit_M, "T_exit_R": t_exit_R,
             "speed_L": calc_speed(l_entry, t_exit_L), "speed_M": calc_speed(m_entry, t_exit_M), "speed_R": calc_speed(r_entry, t_exit_R),
             "overall_speed": overall_spd,
